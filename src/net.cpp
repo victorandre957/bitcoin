@@ -40,6 +40,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -119,6 +120,7 @@ bool fListen = true;
 GlobalMutex g_maplocalhost_mutex;
 std::map<CNetAddr, LocalServiceInfo> mapLocalHost GUARDED_BY(g_maplocalhost_mutex);
 std::string strSubVersion;
+static std::atomic<uint64_t> g_local_address_epoch{0};
 
 size_t CSerializedNetMsg::GetMemoryUsage() const noexcept
 {
@@ -158,8 +160,13 @@ uint16_t GetListenPort()
         }
     }
 
-    // Otherwise, if -port= is provided, use that. Otherwise use the default port.
-    return static_cast<uint16_t>(gArgs.GetIntArg("-port", Params().GetDefaultPort()));
+    const uint16_t default_port{static_cast<uint16_t>(
+        gArgs.GetBoolArg(DYNAMIC_RANDOMIZE_P2P_PORT_ARG, false) && !gArgs.IsArgSet("-port") ?
+            gArgs.GetIntArg(DYNAMIC_RANDOMIZED_P2P_PORT_ARG, Params().GetDefaultPort()) :
+            Params().GetDefaultPort())};
+
+    // Otherwise, if -port= is provided, use that. Otherwise use the default or randomized port.
+    return static_cast<uint16_t>(gArgs.GetIntArg("-port", default_port));
 }
 
 // Determine the "best" local address for a particular peer.
@@ -336,6 +343,24 @@ bool IsLocal(const CService& addr)
 {
     LOCK(g_maplocalhost_mutex);
     return mapLocalHost.contains(addr);
+}
+
+uint64_t GetLocalAddressEpoch()
+{
+    return g_local_address_epoch.load(std::memory_order_relaxed);
+}
+
+static void UpdateLocalAddressPort(uint16_t old_port, uint16_t new_port)
+{
+    {
+        LOCK(g_maplocalhost_mutex);
+        for (auto& [_, info] : mapLocalHost) {
+            if (info.nPort == old_port) {
+                info.nPort = new_port;
+            }
+        }
+    }
+    g_local_address_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool CConnman::AlreadyConnectedToHost(std::string_view host) const
@@ -1742,7 +1767,7 @@ bool CConnman::AttemptToEvictConnection()
     return false;
 }
 
-void CConnman::AcceptConnection(const ListenSocket& hListenSocket) {
+bool CConnman::AcceptConnection(const ListenSocket& hListenSocket) {
     AssertLockNotHeld(m_nodes_mutex);
 
     struct sockaddr_storage sockaddr;
@@ -1754,7 +1779,7 @@ void CConnman::AcceptConnection(const ListenSocket& hListenSocket) {
         if (nErr != WSAEWOULDBLOCK) {
             LogInfo("socket error accept failed: %s\n", NetworkErrorString(nErr));
         }
-        return;
+        return false;
     }
 
     CService addr;
@@ -1769,10 +1794,10 @@ void CConnman::AcceptConnection(const ListenSocket& hListenSocket) {
     NetPermissionFlags permission_flags = NetPermissionFlags::None;
     hListenSocket.AddSocketPermissionFlags(permission_flags);
 
-    CreateNodeFromAcceptedSocket(std::move(sock), permission_flags, addr_bind, addr);
+    return CreateNodeFromAcceptedSocket(std::move(sock), permission_flags, addr_bind, addr);
 }
 
-void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
+bool CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
                                             NetPermissionFlags permission_flags,
                                             const CService& addr_bind,
                                             const CService& addr)
@@ -1796,12 +1821,12 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
 
     if (!fNetworkActive) {
         LogDebug(BCLog::NET, "connection from %s dropped: not accepting new connections\n", addr.ToStringAddrPort());
-        return;
+        return false;
     }
 
     if (!sock->IsSelectable()) {
         LogInfo("connection from %s dropped: non-selectable socket\n", addr.ToStringAddrPort());
-        return;
+        return false;
     }
 
     // According to the internet TCP_NODELAY is not carried into accepted sockets
@@ -1817,7 +1842,7 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
     if (!NetPermissions::HasFlag(permission_flags, NetPermissionFlags::NoBan) && banned)
     {
         LogDebug(BCLog::NET, "connection from %s dropped (banned)\n", addr.ToStringAddrPort());
-        return;
+        return false;
     }
 
     // Only accept connections from discouraged peers if our inbound slots aren't (almost) full.
@@ -1825,7 +1850,7 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
     if (!NetPermissions::HasFlag(permission_flags, NetPermissionFlags::NoBan) && nInbound + 1 >= m_max_inbound && discouraged)
     {
         LogDebug(BCLog::NET, "connection from %s dropped (discouraged)\n", addr.ToStringAddrPort());
-        return;
+        return false;
     }
 
     if (nInbound >= m_max_inbound)
@@ -1833,7 +1858,7 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
         if (!AttemptToEvictConnection()) {
             // No connection to evict, disconnect the new connection
             LogDebug(BCLog::NET, "failed to find an eviction candidate - connection dropped (full)\n");
-            return;
+            return false;
         }
     }
 
@@ -1882,6 +1907,7 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
 
     // We received a new connection, harvest entropy from the time (and our peer count)
     RandAddEvent((uint32_t)id);
+    return true;
 }
 
 bool CConnman::AddConnection(const std::string& address, ConnectionType conn_type, bool use_v2transport = false)
@@ -2250,14 +2276,21 @@ void CConnman::SocketHandlerListening(const Sock::EventsPerSock& events_per_sock
 {
     AssertLockNotHeld(m_nodes_mutex);
 
+    bool rotate_dynamic_port{false};
     for (const ListenSocket& listen_socket : vhListenSocket) {
         if (m_interrupt_net->interrupted()) {
             return;
         }
         const auto it = events_per_sock.find(listen_socket.sock);
         if (it != events_per_sock.end() && it->second.occurred & Sock::RECV) {
-            AcceptConnection(listen_socket);
+            if (AcceptConnection(listen_socket) && listen_socket.m_dynamic) {
+                rotate_dynamic_port = true;
+                break;
+            }
         }
+    }
+    if (rotate_dynamic_port) {
+        RotateDynamicListenPort();
     }
 }
 
@@ -3345,7 +3378,7 @@ void CConnman::ThreadPrivateBroadcast()
     }
 }
 
-bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError, NetPermissionFlags permissions)
+std::optional<CConnman::ListenSocket> CConnman::CreateListenSocket(const CService& addrBind, bilingual_str& strError, NetPermissionFlags permissions, bool dynamic)
 {
     int nOne = 1;
 
@@ -3356,14 +3389,14 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
     {
         strError = Untranslated(strprintf("Bind address family for %s not supported", addrBind.ToStringAddrPort()));
         LogError("%s\n", strError.original);
-        return false;
+        return std::nullopt;
     }
 
     std::unique_ptr<Sock> sock = CreateSock(addrBind.GetSAFamily(), SOCK_STREAM, IPPROTO_TCP);
     if (!sock) {
         strError = Untranslated(strprintf("Couldn't open socket for incoming connections (socket returned error %s)", NetworkErrorString(WSAGetLastError())));
         LogError("%s\n", strError.original);
-        return false;
+        return std::nullopt;
     }
 
     // Allow binding if the port is still in TIME_WAIT state after
@@ -3398,7 +3431,7 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
         else
             strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %s)"), addrBind.ToStringAddrPort(), NetworkErrorString(nErr));
         LogError("%s\n", strError.original);
-        return false;
+        return std::nullopt;
     }
     LogInfo("Bound to %s\n", addrBind.ToStringAddrPort());
 
@@ -3407,10 +3440,17 @@ bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError,
     {
         strError = strprintf(_("Listening for incoming connections failed (listen returned error %s)"), NetworkErrorString(WSAGetLastError()));
         LogError("%s\n", strError.original);
-        return false;
+        return std::nullopt;
     }
 
-    vhListenSocket.emplace_back(std::move(sock), permissions);
+    return ListenSocket{std::shared_ptr<Sock>{std::move(sock)}, permissions, dynamic};
+}
+
+bool CConnman::BindListenPort(const CService& addrBind, bilingual_str& strError, NetPermissionFlags permissions, bool dynamic)
+{
+    auto listen_socket{CreateListenSocket(addrBind, strError, permissions, dynamic)};
+    if (!listen_socket) return false;
+    vhListenSocket.push_back(std::move(*listen_socket));
     return true;
 }
 
@@ -3478,12 +3518,12 @@ uint16_t CConnman::GetDefaultPort(const std::string& addr) const
     return a.SetSpecial(addr) ? GetDefaultPort(a.GetNetwork()) : m_params.GetDefaultPort();
 }
 
-bool CConnman::Bind(const CService& addr_, unsigned int flags, NetPermissionFlags permissions)
+bool CConnman::Bind(const CService& addr_, unsigned int flags, NetPermissionFlags permissions, bool dynamic)
 {
     const CService addr{MaybeFlipIPv6toCJDNS(addr_)};
 
     bilingual_str strError;
-    if (!BindListenPort(addr, strError, permissions)) {
+    if (!BindListenPort(addr, strError, permissions, dynamic)) {
         if ((flags & BF_REPORT_ERROR) && m_client_interface) {
             m_client_interface->ThreadSafeMessageBox(strError, CClientUIInterface::MSG_ERROR);
         }
@@ -3519,16 +3559,73 @@ bool CConnman::InitBinds(const Options& options)
         // may not have IPv6 support and the user did not explicitly ask us to
         // bind on that.
         const CService ipv6_any{in6_addr(COMPAT_IN6ADDR_ANY_INIT), GetListenPort()}; // ::
-        Bind(ipv6_any, BF_NONE, NetPermissionFlags::None);
+        Bind(ipv6_any, BF_NONE, NetPermissionFlags::None, options.m_dynamic_randomize_p2p_port);
 
         struct in_addr inaddr_any;
         inaddr_any.s_addr = htonl(INADDR_ANY);
         const CService ipv4_any{inaddr_any, GetListenPort()}; // 0.0.0.0
-        if (!Bind(ipv4_any, BF_REPORT_ERROR, NetPermissionFlags::None)) {
+        if (!Bind(ipv4_any, BF_REPORT_ERROR, NetPermissionFlags::None, options.m_dynamic_randomize_p2p_port)) {
             return false;
+        }
+        if (options.m_dynamic_randomize_p2p_port) {
+            m_dynamic_randomized_p2p_port = GetListenPort();
         }
     }
     return true;
+}
+
+std::optional<uint16_t> CConnman::GetDynamicRandomizedP2PPort() const
+{
+    if (!m_dynamic_randomize_p2p_port) return std::nullopt;
+    return m_dynamic_randomized_p2p_port;
+}
+
+bool CConnman::RotateDynamicListenPort()
+{
+    if (!m_dynamic_randomize_p2p_port || !m_dynamic_randomized_p2p_port) return false;
+
+    const uint16_t old_port{*m_dynamic_randomized_p2p_port};
+    FastRandomContext rng;
+    static constexpr int MAX_DYNAMIC_RANDOMIZED_P2P_PORT_TRIES{512};
+
+    for (int i{0}; i < MAX_DYNAMIC_RANDOMIZED_P2P_PORT_TRIES; ++i) {
+        const uint16_t port{static_cast<uint16_t>(DYNAMIC_RANDOMIZED_P2P_PORT_MIN + rng.randrange<uint32_t>(DYNAMIC_RANDOMIZED_P2P_PORT_MAX - DYNAMIC_RANDOMIZED_P2P_PORT_MIN + 1))};
+        if (port == old_port || IsBadPort(port)) continue;
+
+        std::vector<ListenSocket> new_listen_sockets;
+
+        // Match InitBinds(): IPv6 any is best-effort, IPv4 any is required.
+        const CService ipv6_any{in6_addr(COMPAT_IN6ADDR_ANY_INIT), port};
+        bilingual_str ipv6_error;
+        if (auto ipv6_socket{CreateListenSocket(ipv6_any, ipv6_error, NetPermissionFlags::None, /*dynamic=*/true)}) {
+            new_listen_sockets.push_back(std::move(*ipv6_socket));
+        }
+
+        struct in_addr inaddr_any;
+        inaddr_any.s_addr = htonl(INADDR_ANY);
+        const CService ipv4_any{inaddr_any, port};
+        bilingual_str ipv4_error;
+        auto ipv4_socket{CreateListenSocket(ipv4_any, ipv4_error, NetPermissionFlags::None, /*dynamic=*/true)};
+        if (!ipv4_socket) continue;
+        new_listen_sockets.push_back(std::move(*ipv4_socket));
+
+        vhListenSocket.erase(std::remove_if(vhListenSocket.begin(), vhListenSocket.end(), [](const ListenSocket& listen_socket) {
+            return listen_socket.m_dynamic;
+        }), vhListenSocket.end());
+        for (auto& listen_socket : new_listen_sockets) {
+            vhListenSocket.push_back(std::move(listen_socket));
+        }
+
+        m_dynamic_randomized_p2p_port = port;
+        gArgs.ForceSetArg(DYNAMIC_RANDOMIZED_P2P_PORT_ARG, util::ToString(port));
+        UpdateLocalAddressPort(old_port, port);
+        LogInfo("Rotated dynamic randomized P2P port from %u to %u\n", old_port, port);
+        return true;
+    }
+
+    LogWarning("Unable to rotate dynamic randomized P2P port after %d tries; keeping port %u\n",
+               MAX_DYNAMIC_RANDOMIZED_P2P_PORT_TRIES, old_port);
+    return false;
 }
 
 bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)

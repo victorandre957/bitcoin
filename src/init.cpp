@@ -106,6 +106,7 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <cerrno>
 #include <condition_variable>
 #include <cstddef>
@@ -595,6 +596,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-peerblockfilters", strprintf("Serve compact block filters to peers per BIP 157 (default: %u)", DEFAULT_PEERBLOCKFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-txreconciliation", strprintf("Enable transaction reconciliations per BIP 330 (default: %d)", DEFAULT_TXRECONCILIATION_ENABLE), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-port=<port>", strprintf("Listen for connections on <port> (default: %u, testnet3: %u, testnet4: %u, signet: %u, regtest: %u). Not relevant for I2P (see doc/i2p.md). If set to a value x, the default onion listening port will be set to x+1.", defaultChainParams->GetDefaultPort(), testnetChainParams->GetDefaultPort(), testnet4ChainParams->GetDefaultPort(), signetChainParams->GetDefaultPort(), regtestChainParams->GetDefaultPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg(DYNAMIC_RANDOMIZE_P2P_PORT_ARG, strprintf("Dynamically rotate the randomized listening P2P port after each accepted inbound clearnet connection. This option cannot be used with -port, -bind, or -whitebind. Randomized ports are selected from %u-%u (default: 0)", DYNAMIC_RANDOMIZED_P2P_PORT_MIN, DYNAMIC_RANDOMIZED_P2P_PORT_MAX), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg(strprintf("%s=<port>", DYNAMIC_RANDOMIZED_P2P_PORT_ARG), "", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::HIDDEN);
     const std::string proxy_doc_for_value =
 #ifdef HAVE_SOCKADDR_UN
         "<ip>[:<port>]|unix:<path>";
@@ -1276,6 +1279,87 @@ bool CheckHostPortOptions(const ArgsManager& args) {
     return true;
 }
 
+static constexpr std::array<uint16_t, 5> RESERVED_P2P_PORTS{
+    8333, 18333, 38333, 48333, 18444};
+
+static bool ValidateDynamicRandomizedP2PPort(uint16_t port, const std::string& option)
+{
+    if (std::find(RESERVED_P2P_PORTS.begin(), RESERVED_P2P_PORTS.end(), port) != RESERVED_P2P_PORTS.end()) {
+        return InitError(strprintf(_("%s cannot be set to reserved P2P port %u when -dynamicrandomizep2pport is enabled."), option, port));
+    }
+    if (port < DYNAMIC_RANDOMIZED_P2P_PORT_MIN || port > DYNAMIC_RANDOMIZED_P2P_PORT_MAX) {
+        return InitError(strprintf(_("%s must be in the dynamic randomized P2P port range %u-%u when -dynamicrandomizep2pport is enabled."), option, DYNAMIC_RANDOMIZED_P2P_PORT_MIN, DYNAMIC_RANDOMIZED_P2P_PORT_MAX));
+    }
+    if (IsBadPort(port)) {
+        return InitError(strprintf(_("%s cannot be set to port %u when -dynamicrandomizep2pport is enabled because this port is considered \"bad\". See doc/p2p-bad-ports.md for details."), option, port));
+    }
+    return true;
+}
+
+static bool CanBindListenPort(const CService& addr_bind)
+{
+    struct sockaddr_storage sockaddr;
+    socklen_t len{sizeof(sockaddr)};
+    if (!addr_bind.GetSockAddr(reinterpret_cast<struct sockaddr*>(&sockaddr), &len)) return false;
+
+    std::unique_ptr<Sock> sock{CreateSock(addr_bind.GetSAFamily(), SOCK_STREAM, IPPROTO_TCP)};
+    if (!sock) return false;
+
+    const int one{1};
+    sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    if (addr_bind.IsIPv6()) {
+#ifdef IPV6_V6ONLY
+        sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+#endif
+#ifdef WIN32
+        const int prot_level{PROTECTION_LEVEL_UNRESTRICTED};
+        sock->SetSockOpt(IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, &prot_level, sizeof(prot_level));
+#endif
+    }
+
+    return sock->Bind(reinterpret_cast<struct sockaddr*>(&sockaddr), len) != SOCKET_ERROR &&
+           sock->Listen(SOMAXCONN) != SOCKET_ERROR;
+}
+
+static bool DynamicP2PPortIsAvailable(uint16_t port)
+{
+    struct in_addr inaddr_any;
+    inaddr_any.s_addr = htonl(INADDR_ANY);
+    return CanBindListenPort(CService{inaddr_any, port});
+}
+
+static bool InitDynamicRandomizedP2PPort(ArgsManager& args)
+{
+    if (!args.GetBoolArg(DYNAMIC_RANDOMIZE_P2P_PORT_ARG, false)) return true;
+
+    if (args.IsArgSet("-port")) {
+        return InitError(strprintf(_("%s cannot be used with -port."), DYNAMIC_RANDOMIZE_P2P_PORT_ARG));
+    }
+
+    if (!args.GetBoolArg("-listen", DEFAULT_LISTEN)) {
+        return InitError(strprintf(_("%s requires -listen=1."), DYNAMIC_RANDOMIZE_P2P_PORT_ARG));
+    }
+
+    if (args.IsArgSet("-bind") || args.IsArgSet("-whitebind")) {
+        return InitError(strprintf(_("%s cannot be used with -bind or -whitebind."), DYNAMIC_RANDOMIZE_P2P_PORT_ARG));
+    }
+
+    FastRandomContext rng;
+    static constexpr int MAX_DYNAMIC_RANDOMIZED_P2P_PORT_TRIES{512};
+    for (int i{0}; i < MAX_DYNAMIC_RANDOMIZED_P2P_PORT_TRIES; ++i) {
+        const uint16_t port{static_cast<uint16_t>(DYNAMIC_RANDOMIZED_P2P_PORT_MIN + rng.randrange<uint32_t>(DYNAMIC_RANDOMIZED_P2P_PORT_MAX - DYNAMIC_RANDOMIZED_P2P_PORT_MIN + 1))};
+        if (!ValidateDynamicRandomizedP2PPort(port, DYNAMIC_RANDOMIZE_P2P_PORT_ARG)) return false;
+        if (!DynamicP2PPortIsAvailable(port)) continue;
+
+        args.ForceSetArg(DYNAMIC_RANDOMIZED_P2P_PORT_ARG, ToString(port));
+        LogInfo("Using dynamic randomized P2P port %u\n", port);
+        return true;
+    }
+
+    return InitError(strprintf(_("Unable to find an available dynamic randomized P2P port in range %u-%u."), DYNAMIC_RANDOMIZED_P2P_PORT_MIN, DYNAMIC_RANDOMIZED_P2P_PORT_MAX));
+}
+
 /**
  * @brief Checks for duplicate bindings across all binding configurations.
  *
@@ -1437,7 +1521,7 @@ static ChainstateLoadResult InitAndLoadChainstate(
 
 bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 {
-    const ArgsManager& args = *Assert(node.args);
+    ArgsManager& args = *Assert(node.args);
     const CChainParams& chainparams = Params();
 
     auto opt_max_upload = ParseByteUnits(args.GetArg("-maxuploadtarget", DEFAULT_MAX_UPLOAD_TARGET), ByteUnit::M);
@@ -1540,6 +1624,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     // Check port numbers
     if (!CheckHostPortOptions(args)) return false;
+    if (!InitDynamicRandomizedP2PPort(args)) return false;
 
     // Configure reachable networks before we start the RPC server.
     // This is necessary for -rpcallowip to distinguish CJDNS from other RFC4193
@@ -1819,10 +1904,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     for (const std::string& strAddr : args.GetArgs("-externalip")) {
         const std::optional<CService> addrLocal{Lookup(strAddr, GetListenPort(), fNameLookup)};
-        if (addrLocal.has_value() && addrLocal->IsValid())
+        if (addrLocal.has_value() && addrLocal->IsValid()) {
             AddLocal(addrLocal.value(), LOCAL_MANUAL);
-        else
+        } else {
             return InitError(ResolveErrMsg("externalip", strAddr));
+        }
     }
 
 #ifdef ENABLE_ZMQ
@@ -2128,12 +2214,16 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);
     connOptions.whitelist_relay = args.GetBoolArg("-whitelistrelay", DEFAULT_WHITELISTRELAY);
     connOptions.m_capture_messages = args.GetBoolArg("-capturemessages", false);
+    connOptions.m_dynamic_randomize_p2p_port = args.GetBoolArg(DYNAMIC_RANDOMIZE_P2P_PORT_ARG, false);
 
     // Port to bind to if `-bind=addr` is provided without a `:port` suffix.
-    const uint16_t default_bind_port =
-        static_cast<uint16_t>(args.GetIntArg("-port", Params().GetDefaultPort()));
+    const uint16_t default_port{static_cast<uint16_t>(
+        args.GetBoolArg(DYNAMIC_RANDOMIZE_P2P_PORT_ARG, false) ?
+            args.GetIntArg(DYNAMIC_RANDOMIZED_P2P_PORT_ARG, Params().GetDefaultPort()) :
+            Params().GetDefaultPort())};
+    const uint16_t default_bind_port{static_cast<uint16_t>(args.GetIntArg("-port", default_port))};
 
-    const uint16_t default_bind_port_onion = default_bind_port + 1;
+    const uint16_t default_bind_port_onion = (args.GetBoolArg(DYNAMIC_RANDOMIZE_P2P_PORT_ARG, false) ? Params().GetDefaultPort() : default_bind_port) + 1;
 
     const auto BadPortWarning = [](const char* prefix, uint16_t port) {
         return strprintf(_("%s request to listen on port %u. This port is considered \"bad\" and "
@@ -2320,7 +2410,6 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (!node.connman->Start(scheduler, connOptions)) {
         return false;
     }
-
     // ********************************************************* Step 13: finished
 
     // At this point, the RPC is "started", but still in warmup, which means it

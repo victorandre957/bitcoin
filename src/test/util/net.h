@@ -81,7 +81,7 @@ struct ConnmanTestMsg : public CConnman {
                                             const CAddress& addr_bind,
                                             const CAddress& addr_peer)
     {
-        CreateNodeFromAcceptedSocket(std::move(sock), permissions, addr_bind, addr_peer);
+        (void)CreateNodeFromAcceptedSocket(std::move(sock), permissions, addr_bind, addr_peer);
     }
 
     bool InitBindsPublic(const CConnman::Options& options)

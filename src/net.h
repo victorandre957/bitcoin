@@ -98,6 +98,11 @@ static constexpr bool DEFAULT_FIXEDSEEDS{true};
 static const size_t DEFAULT_MAXRECEIVEBUFFER = 5 * 1000;
 static const size_t DEFAULT_MAXSENDBUFFER    = 1 * 1000;
 
+static constexpr const char* DYNAMIC_RANDOMIZE_P2P_PORT_ARG{"-dynamicrandomizep2pport"};
+static constexpr const char* DYNAMIC_RANDOMIZED_P2P_PORT_ARG{"-dynamicrandomizedp2pport"};
+static constexpr uint16_t DYNAMIC_RANDOMIZED_P2P_PORT_MIN{49152};
+static constexpr uint16_t DYNAMIC_RANDOMIZED_P2P_PORT_MAX{65534};
+
 static constexpr bool DEFAULT_V2_TRANSPORT{true};
 
 typedef int64_t NodeId;
@@ -170,6 +175,7 @@ void RemoveLocal(const CService& addr);
 bool SeenLocal(const CService& addr);
 bool IsLocal(const CService& addr);
 CService GetLocalAddress(const CNode& peer);
+uint64_t GetLocalAddressEpoch();
 
 extern bool fDiscover;
 extern bool fListen;
@@ -1103,6 +1109,7 @@ public:
         /// True if the user did not specify -bind= or -whitebind= and thus
         /// we should bind on `0.0.0.0` (IPv4) and `::` (IPv6).
         bool bind_on_any;
+        bool m_dynamic_randomize_p2p_port{false};
         bool m_use_addrman_outgoing = true;
         std::vector<std::string> m_specified_outgoing;
         std::vector<std::string> m_added_nodes;
@@ -1135,6 +1142,8 @@ public:
         }
         vWhitelistedRangeIncoming = connOptions.vWhitelistedRangeIncoming;
         vWhitelistedRangeOutgoing = connOptions.vWhitelistedRangeOutgoing;
+        m_dynamic_randomize_p2p_port = connOptions.m_dynamic_randomize_p2p_port;
+        m_dynamic_randomized_p2p_port.reset();
         {
             LOCK(m_added_nodes_mutex);
             // Attempt v2 connection if we support v2 - we'll reconnect with v1 if our
@@ -1368,6 +1377,7 @@ public:
 
     size_t GetNodeCount(ConnectionDirection) const EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     std::map<CNetAddr, LocalServiceInfo> getNetLocalAddresses() const;
+    std::optional<uint16_t> GetDynamicRandomizedP2PPort() const;
     uint32_t GetMappedAS(const CNetAddr& addr) const;
     void GetNodeStats(std::vector<CNodeStats>& vstats) const EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     bool DisconnectNode(std::string_view node) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
@@ -1419,9 +1429,10 @@ private:
     struct ListenSocket {
     public:
         std::shared_ptr<Sock> sock;
+        bool m_dynamic;
         inline void AddSocketPermissionFlags(NetPermissionFlags& flags) const { NetPermissions::AddFlag(flags, m_permissions); }
-        ListenSocket(std::shared_ptr<Sock> sock_, NetPermissionFlags permissions_)
-            : sock{sock_}, m_permissions{permissions_}
+        ListenSocket(std::shared_ptr<Sock> sock_, NetPermissionFlags permissions_, bool dynamic)
+            : sock{sock_}, m_dynamic{dynamic}, m_permissions{permissions_}
         {
         }
 
@@ -1433,9 +1444,11 @@ private:
     //! in case of no limit, it will always return 0
     std::chrono::seconds GetMaxOutboundTimeLeftInCycle_() const EXCLUSIVE_LOCKS_REQUIRED(m_total_bytes_sent_mutex);
 
-    bool BindListenPort(const CService& bindAddr, bilingual_str& strError, NetPermissionFlags permissions);
-    bool Bind(const CService& addr, unsigned int flags, NetPermissionFlags permissions);
+    std::optional<ListenSocket> CreateListenSocket(const CService& bindAddr, bilingual_str& strError, NetPermissionFlags permissions, bool dynamic);
+    bool BindListenPort(const CService& bindAddr, bilingual_str& strError, NetPermissionFlags permissions, bool dynamic);
+    bool Bind(const CService& addr, unsigned int flags, NetPermissionFlags permissions, bool dynamic = false);
     bool InitBinds(const Options& options);
+    bool RotateDynamicListenPort();
 
     /// \anchor addcon
     void ThreadOpenAddedConnections() EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex,
@@ -1462,7 +1475,7 @@ private:
     /// \anchor i2paccept
     void ThreadI2PAcceptIncoming() EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     void ThreadPrivateBroadcast() EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_unused_i2p_sessions_mutex);
-    void AcceptConnection(const ListenSocket& hListenSocket) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
+    bool AcceptConnection(const ListenSocket& hListenSocket) EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
 
     /**
      * Create a `CNode` object from a socket that has just been accepted and add the node to
@@ -1472,7 +1485,7 @@ private:
      * @param[in] addr_bind The address and port at our side of the connection.
      * @param[in] addr The address and port at the peer's side of the connection.
      */
-    void CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
+    bool CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
                                       NetPermissionFlags permission_flags,
                                       const CService& addr_bind,
                                       const CService& addr)
@@ -1628,6 +1641,8 @@ private:
     unsigned int nReceiveFloodSize{0};
 
     std::vector<ListenSocket> vhListenSocket;
+    bool m_dynamic_randomize_p2p_port{false};
+    std::optional<uint16_t> m_dynamic_randomized_p2p_port;
     std::atomic<bool> fNetworkActive{true};
     bool fAddressesInitialized{false};
     std::reference_wrapper<AddrMan> addrman;

@@ -663,6 +663,11 @@ static RPCMethod getnetworkinfo()
                         {RPCResult::Type::NUM, "connections_in", "the number of inbound connections"},
                         {RPCResult::Type::NUM, "connections_out", "the number of outbound connections"},
                         {RPCResult::Type::BOOL, "networkactive", "whether p2p networking is enabled"},
+                        {RPCResult::Type::OBJ, "dynamicrandomizedp2pport", "dynamic randomized P2P port state",
+                        {
+                            {RPCResult::Type::BOOL, "enabled", "whether dynamic randomized P2P port rotation is enabled"},
+                            {RPCResult::Type::NUM, "port", /*optional=*/true, "the current dynamic randomized P2P port"},
+                        }},
                         {RPCResult::Type::ARR, "networks", "information per network",
                         {
                             {RPCResult::Type::OBJ, "", "",
@@ -722,6 +727,14 @@ static RPCMethod getnetworkinfo()
         obj.pushKV("connections", node.connman->GetNodeCount(ConnectionDirection::Both));
         obj.pushKV("connections_in", node.connman->GetNodeCount(ConnectionDirection::In));
         obj.pushKV("connections_out", node.connman->GetNodeCount(ConnectionDirection::Out));
+        UniValue dynamic_port(UniValue::VOBJ);
+        if (const auto port{node.connman->GetDynamicRandomizedP2PPort()}) {
+            dynamic_port.pushKV("enabled", true);
+            dynamic_port.pushKV("port", *port);
+        } else {
+            dynamic_port.pushKV("enabled", false);
+        }
+        obj.pushKV("dynamicrandomizedp2pport", std::move(dynamic_port));
     }
     obj.pushKV("networks",      GetNetworksInfo());
     if (node.mempool) {

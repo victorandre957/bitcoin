@@ -368,6 +368,8 @@ struct Peer {
     std::chrono::microseconds m_next_addr_send GUARDED_BY(m_addr_send_times_mutex){0};
     /** Time point to possibly re-announce our local address to this peer. */
     std::chrono::microseconds m_next_local_addr_send GUARDED_BY(m_addr_send_times_mutex){0};
+    /** Local address epoch used to trigger early self-announcements after dynamic port rotation. */
+    uint64_t m_last_local_addr_epoch GUARDED_BY(m_addr_send_times_mutex){0};
     /** Whether the peer has signaled support for receiving ADDRv2 (BIP155)
      *  messages, indicating a preference to receive ADDRv2 instead of ADDR ones. */
     std::atomic_bool m_wants_addrv2{false};
@@ -5465,16 +5467,18 @@ void PeerManagerImpl::MaybeSendAddr(CNode& node, Peer& peer, std::chrono::micros
     if (!peer.m_addr_relay_enabled) return;
 
     LOCK(peer.m_addr_send_times_mutex);
+    const uint64_t local_address_epoch{GetLocalAddressEpoch()};
+    const bool local_address_changed{peer.m_last_local_addr_epoch != local_address_epoch};
     // Periodically advertise our local address to the peer.
     if (fListen && !m_chainman.IsInitialBlockDownload() &&
-        peer.m_next_local_addr_send < current_time) {
+        (peer.m_next_local_addr_send < current_time || local_address_changed)) {
         // If we've sent before, clear the bloom filter for the peer, so that our
         // self-announcement will actually go out.
         // This might be unnecessary if the bloom filter has already rolled
         // over since our last self-announcement, but there is only a small
         // bandwidth cost that we can incur by doing this (which happens
         // once a day on average).
-        if (peer.m_next_local_addr_send != 0us) {
+        if (peer.m_next_local_addr_send != 0us || local_address_changed) {
             peer.m_addr_known->reset();
         }
         if (std::optional<CService> local_service = GetLocalAddrForPeer(node)) {
@@ -5497,6 +5501,7 @@ void PeerManagerImpl::MaybeSendAddr(CNode& node, Peer& peer, std::chrono::micros
             }
         }
         peer.m_next_local_addr_send = current_time + m_rng.rand_exp_duration(AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL);
+        peer.m_last_local_addr_epoch = local_address_epoch;
     }
 
     // We sent an `addr` message to this peer recently. Nothing more to do.
