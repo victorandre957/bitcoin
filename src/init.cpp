@@ -106,6 +106,7 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <cerrno>
 #include <condition_variable>
 #include <cstddef>
@@ -605,7 +606,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-peerbloomfilters", strprintf("Support filtering of blocks and transaction with bloom filters (default: %u)", DEFAULT_PEERBLOOMFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peerblockfilters", strprintf("Serve compact block filters to peers per BIP 157 (default: %u)", DEFAULT_PEERBLOCKFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-txreconciliation", strprintf("Enable transaction reconciliations per BIP 330 (default: %d)", DEFAULT_TXRECONCILIATION_ENABLE), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-port=<port>", strprintf("Listen for connections on <port> (default: %u, testnet3: %u, testnet4: %u, signet: %u, regtest: %u). Not relevant for I2P (see doc/i2p.md). If set to a value x, the default onion listening port will be set to x+1.", defaultChainParams->GetDefaultPort(), testnetChainParams->GetDefaultPort(), testnet4ChainParams->GetDefaultPort(), signetChainParams->GetDefaultPort(), regtestChainParams->GetDefaultPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-port=<port>", strprintf("Listen for connections on <port> (default: %u, testnet3: %u, testnet4: %u, signet: %u, regtest: %u). If set to 0, a randomized port from %u-%u will be selected on first startup and reused on later startups. Not relevant for I2P (see doc/i2p.md). If set to a value x, the default onion listening port will be set to x+1.", defaultChainParams->GetDefaultPort(), testnetChainParams->GetDefaultPort(), testnet4ChainParams->GetDefaultPort(), signetChainParams->GetDefaultPort(), regtestChainParams->GetDefaultPort(), RANDOMIZED_P2P_PORT_MIN, RANDOMIZED_P2P_PORT_MAX), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg(strprintf("%s=<port>", RANDOMIZED_P2P_PORT_ARG), "", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::HIDDEN);
     const std::string proxy_doc_for_value =
 #ifdef HAVE_SOCKADDR_UN
         "<ip>[:<port>]|unix:<path>";
@@ -1249,7 +1251,7 @@ bool CheckHostPortOptions(const ArgsManager& args) {
     }) {
         if (const auto port{args.GetArg(port_option)}) {
             const auto n{ToIntegral<uint16_t>(*port)};
-            if (!n || *n == 0) {
+            if (!n || (*n == 0 && port_option != "-port")) {
                 return InitError(InvalidPortErrMsg(port_option, *port));
             }
         }
@@ -1289,6 +1291,178 @@ bool CheckHostPortOptions(const ArgsManager& args) {
     }
 
     return true;
+}
+
+static constexpr std::array<uint16_t, 5> RESERVED_P2P_PORTS{
+    8333, 18333, 38333, 48333, 18444};
+
+static std::string RandomizedP2PPortSettingName()
+{
+    return std::string{RANDOMIZED_P2P_PORT_ARG}.substr(1);
+}
+
+static bool IsRandomizedP2PPortRequested(const ArgsManager& args)
+{
+    const auto port_arg{args.GetArg("-port")};
+    return port_arg && ToIntegral<uint16_t>(*port_arg) == 0;
+}
+
+static bool ValidateRandomizedP2PPort(uint16_t port, const std::string& option)
+{
+    if (std::find(RESERVED_P2P_PORTS.begin(), RESERVED_P2P_PORTS.end(), port) != RESERVED_P2P_PORTS.end()) {
+        return InitError(strprintf(_("%s cannot be set to reserved P2P port %u when -port=0 is used."), option, port));
+    }
+    if (port < RANDOMIZED_P2P_PORT_MIN || port > RANDOMIZED_P2P_PORT_MAX) {
+        return InitError(strprintf(_("%s must be in the randomized P2P port range %u-%u when -port=0 is used."), option, RANDOMIZED_P2P_PORT_MIN, RANDOMIZED_P2P_PORT_MAX));
+    }
+    if (IsBadPort(port)) {
+        return InitError(strprintf(_("%s cannot be set to port %u when -port=0 is used because this port is considered \"bad\". See doc/p2p-bad-ports.md for details."), option, port));
+    }
+    return true;
+}
+
+static bool IsValidGeneratedP2PPort(uint16_t port)
+{
+    return std::find(RESERVED_P2P_PORTS.begin(), RESERVED_P2P_PORTS.end(), port) == RESERVED_P2P_PORTS.end() &&
+           port >= RANDOMIZED_P2P_PORT_MIN &&
+           port <= RANDOMIZED_P2P_PORT_MAX &&
+           !IsBadPort(port);
+}
+
+static std::optional<uint16_t> GetExplicitPort(const std::string& host_port)
+{
+    std::string host;
+    uint16_t port{0};
+    if (!SplitHostPort(host_port, port, host)) return std::nullopt;
+    if (port == 0) return std::nullopt;
+    return port;
+}
+
+static bool ValidateRandomizedP2PPortArgs(const ArgsManager& args)
+{
+    for (const std::string& bind_arg : args.GetArgs("-bind")) {
+        const size_t index{bind_arg.rfind('=')};
+        const std::string bind_host_port{index == std::string::npos ? bind_arg : bind_arg.substr(0, index)};
+        if (const auto port{GetExplicitPort(bind_host_port)}) {
+            if (!ValidateRandomizedP2PPort(*port, "-bind")) return false;
+        }
+    }
+
+    for (const std::string& whitebind_arg : args.GetArgs("-whitebind")) {
+        NetWhitebindPermissions whitebind;
+        bilingual_str error;
+        if (!NetWhitebindPermissions::TryParse(whitebind_arg, whitebind, error)) return InitError(error);
+        if (!ValidateRandomizedP2PPort(whitebind.m_service.GetPort(), "-whitebind")) return false;
+    }
+
+    return true;
+}
+
+static bool HasExplicitAdvertisedP2PPort(const ArgsManager& args)
+{
+    for (const std::string& bind_arg : args.GetArgs("-bind")) {
+        const size_t index{bind_arg.rfind('=')};
+        if (index != std::string::npos) continue;
+        if (GetExplicitPort(bind_arg)) return true;
+    }
+
+    for (const std::string& whitebind_arg : args.GetArgs("-whitebind")) {
+        NetWhitebindPermissions whitebind;
+        bilingual_str error;
+        if (NetWhitebindPermissions::TryParse(whitebind_arg, whitebind, error) &&
+            !NetPermissions::HasFlag(whitebind.m_flags, NetPermissionFlags::NoBan)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool BindUsesDefaultP2PPort(const std::string& bind_arg)
+{
+    const size_t index{bind_arg.rfind('=')};
+    const std::string bind_host_port{index == std::string::npos ? bind_arg : bind_arg.substr(0, index)};
+    return !GetExplicitPort(bind_host_port);
+}
+
+static bool NeedsGeneratedP2PPort(const ArgsManager& args)
+{
+    if (args.IsArgSet("-port") && !IsRandomizedP2PPortRequested(args)) return false;
+    if (!HasExplicitAdvertisedP2PPort(args)) return true;
+    const auto bind_args{args.GetArgs("-bind")};
+    return std::any_of(bind_args.begin(), bind_args.end(), BindUsesDefaultP2PPort);
+}
+
+static bool CanBindListenPort(const CService& addr_bind)
+{
+    struct sockaddr_storage sockaddr;
+    socklen_t len{sizeof(sockaddr)};
+    if (!addr_bind.GetSockAddr(reinterpret_cast<struct sockaddr*>(&sockaddr), &len)) return false;
+
+    std::unique_ptr<Sock> sock{CreateSock(addr_bind.GetSAFamily(), SOCK_STREAM, IPPROTO_TCP)};
+    if (!sock) return false;
+
+    const int one{1};
+    sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    if (addr_bind.IsIPv6()) {
+#ifdef IPV6_V6ONLY
+        sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+#endif
+#ifdef WIN32
+        const int prot_level{PROTECTION_LEVEL_UNRESTRICTED};
+        sock->SetSockOpt(IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, &prot_level, sizeof(prot_level));
+#endif
+    }
+
+    return sock->Bind(reinterpret_cast<struct sockaddr*>(&sockaddr), len) != SOCKET_ERROR &&
+           sock->Listen(SOMAXCONN) != SOCKET_ERROR;
+}
+
+static bool GeneratedP2PPortIsAvailable(uint16_t port)
+{
+    struct in_addr inaddr_any;
+    inaddr_any.s_addr = htonl(INADDR_ANY);
+    return CanBindListenPort(CService{inaddr_any, port});
+}
+
+static bool InitRandomizedP2PPort(ArgsManager& args, std::optional<uint16_t>& generated_port)
+{
+    if (!IsRandomizedP2PPortRequested(args)) return true;
+
+    if (!args.GetBoolArg("-listen", DEFAULT_LISTEN)) return true;
+
+    if (!ValidateRandomizedP2PPortArgs(args)) return false;
+
+    if (const auto port_arg{args.GetArg(RANDOMIZED_P2P_PORT_ARG)}) {
+        const auto port{ToIntegral<uint16_t>(*port_arg)};
+        if (!port || *port == 0) return InitError(InvalidPortErrMsg(RANDOMIZED_P2P_PORT_ARG, *port_arg));
+        if (!ValidateRandomizedP2PPort(*port, RANDOMIZED_P2P_PORT_ARG)) return false;
+        return ValidateRandomizedP2PPort(GetListenPort(), "listening port");
+    }
+
+    if (!NeedsGeneratedP2PPort(args)) {
+        return true;
+    }
+
+    if (!args.GetSettingsPath()) {
+        return InitError(_("Randomized P2P port selection requires the dynamic settings file. Remove -nosettings or set an explicit non-zero -port."));
+    }
+
+    FastRandomContext rng;
+    static constexpr int MAX_RANDOMIZED_P2P_PORT_TRIES{512};
+    for (int i{0}; i < MAX_RANDOMIZED_P2P_PORT_TRIES; ++i) {
+        const uint16_t port{static_cast<uint16_t>(RANDOMIZED_P2P_PORT_MIN + rng.randrange<uint32_t>(RANDOMIZED_P2P_PORT_MAX - RANDOMIZED_P2P_PORT_MIN + 1))};
+        if (!IsValidGeneratedP2PPort(port)) continue;
+        if (!GeneratedP2PPortIsAvailable(port)) continue;
+
+        args.ForceSetArg(RANDOMIZED_P2P_PORT_ARG, ToString(port));
+        generated_port = port;
+        LogInfo("Using randomized P2P port %u\n", port);
+        return true;
+    }
+
+    return InitError(strprintf(_("Unable to find an available randomized P2P port in range %u-%u."), RANDOMIZED_P2P_PORT_MIN, RANDOMIZED_P2P_PORT_MAX));
 }
 
 /**
@@ -1452,8 +1626,9 @@ static ChainstateLoadResult InitAndLoadChainstate(
 
 bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 {
-    const ArgsManager& args = *Assert(node.args);
+    ArgsManager& args = *Assert(node.args);
     const CChainParams& chainparams = Params();
+    std::optional<uint16_t> generated_randomized_p2p_port;
 
     auto opt_max_upload = ParseByteUnits(args.GetArg("-maxuploadtarget", DEFAULT_MAX_UPLOAD_TARGET), ByteUnit::M);
     if (!opt_max_upload) {
@@ -1555,6 +1730,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     // Check port numbers
     if (!CheckHostPortOptions(args)) return false;
+    if (!InitRandomizedP2PPort(args, generated_randomized_p2p_port)) return false;
 
     // Configure reachable networks before we start the RPC server.
     // This is necessary for -rpcallowip to distinguish CJDNS from other RFC4193
@@ -1834,10 +2010,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     for (const std::string& strAddr : args.GetArgs("-externalip")) {
         const std::optional<CService> addrLocal{Lookup(strAddr, GetListenPort(), fNameLookup)};
-        if (addrLocal.has_value() && addrLocal->IsValid())
+        if (addrLocal.has_value() && addrLocal->IsValid()) {
+            if (IsRandomizedP2PPortRequested(args) && !ValidateRandomizedP2PPort(addrLocal->GetPort(), "-externalip")) return false;
             AddLocal(addrLocal.value(), LOCAL_MANUAL, /*add_even_if_unreachable=*/true);
-        else
+        } else {
             return InitError(ResolveErrMsg("externalip", strAddr));
+        }
     }
 
 #ifdef ENABLE_ZMQ
@@ -2160,10 +2338,15 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.m_capture_messages = args.GetBoolArg("-capturemessages", false);
 
     // Port to bind to if `-bind=addr` is provided without a `:port` suffix.
-    const uint16_t default_bind_port =
-        static_cast<uint16_t>(args.GetIntArg("-port", Params().GetDefaultPort()));
+    const uint16_t default_port{static_cast<uint16_t>(Params().GetDefaultPort())};
+    const uint16_t randomized_port{static_cast<uint16_t>(args.GetIntArg(RANDOMIZED_P2P_PORT_ARG, default_port))};
+    const uint16_t default_bind_port{IsRandomizedP2PPortRequested(args) ? randomized_port : static_cast<uint16_t>(args.GetIntArg("-port", default_port))};
 
-    const uint16_t default_bind_port_onion = default_bind_port + 1;
+    // Keep the default Tor target independent from -port=0. The randomized
+    // port only applies to clearnet P2P listeners and announcements.
+    const uint16_t default_bind_port_onion = IsRandomizedP2PPortRequested(args)
+        ? static_cast<uint16_t>(Params().GetDefaultPort() + 1)
+        : default_bind_port + 1;
 
     const auto BadPortWarning = [](const char* prefix, uint16_t port) {
         return strprintf(_("%s request to listen on port %u. This port is considered \"bad\" and "
@@ -2349,6 +2532,15 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     if (!node.connman->Start(scheduler, connOptions)) {
         return false;
+    }
+    if (generated_randomized_p2p_port) {
+        args.LockSettings([&](common::Settings& settings) {
+            settings.rw_settings[RandomizedP2PPortSettingName()] = static_cast<int64_t>(*generated_randomized_p2p_port);
+        });
+        std::vector<std::string> details;
+        if (!args.WriteSettingsFile(&details)) {
+            return InitError(_("Settings file could not be written"), details);
+        }
     }
 
     // ********************************************************* Step 13: finished
