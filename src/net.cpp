@@ -158,8 +158,13 @@ uint16_t GetListenPort()
         }
     }
 
+    const uint16_t default_port{static_cast<uint16_t>(Params().GetDefaultPort())};
+    const uint16_t randomized_port{static_cast<uint16_t>(gArgs.GetIntArg(RANDOMIZED_P2P_PORT_ARG, default_port))};
+    const auto port_arg{gArgs.GetArg("-port")};
+    if (port_arg && ToIntegral<uint16_t>(*port_arg) == 0) return randomized_port;
+
     // Otherwise, if -port= is provided, use that. Otherwise use the default port.
-    return static_cast<uint16_t>(gArgs.GetIntArg("-port", Params().GetDefaultPort()));
+    return static_cast<uint16_t>(gArgs.GetIntArg("-port", default_port));
 }
 
 // Determine the "best" local address for a particular peer.
