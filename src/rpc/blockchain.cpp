@@ -4,73 +4,103 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <rpc/blockchain.h>
+#include <rpc/register.h> // IWYU pragma: associated
 
+#include <arith_uint256.h>
 #include <blockfilter.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
-#include <clientversion.h>
 #include <coins.h>
 #include <common/args.h>
 #include <consensus/amount.h>
+#include <consensus/consensus.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <crypto/hex_base.h>
+#include <dbwrapper.h>
 #include <deploymentinfo.h>
-#include <deploymentstatus.h>
 #include <flatfile.h>
-#include <hash.h>
+#include <index/base.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
-#include <interfaces/mining.h>
+#include <interfaces/types.h>
 #include <kernel/coinstats.h>
 #include <logging/timer.h>
 #include <net.h>
 #include <net_processing.h>
+#include <net_types.h>
+#include <node/block_template_manager.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
-#include <node/transaction.h>
 #include <node/utxo_snapshot.h>
 #include <node/warnings.h>
+#include <policy/feerate.h>
+#include <prevector.h>
+#include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <protocol.h>
+#include <rpc/protocol.h>
 #include <rpc/rawtransaction_util.h>
+#include <rpc/request.h>
 #include <rpc/server.h>
 #include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
+#include <script/interpreter.h>
+#include <script/script.h>
+#include <script/signingprovider.h>
 #include <serialize.h>
+#include <span.h>
 #include <streams.h>
 #include <sync.h>
 #include <tinyformat.h>
 #include <txdb.h>
 #include <txmempool.h>
+#include <uint256.h>
 #include <undo.h>
 #include <univalue.h>
+#include <util/chaintype.h>
 #include <util/check.h>
+#include <util/expected.h>
 #include <util/fs.h>
-#include <util/strencodings.h>
+#include <util/log.h>
+#include <util/result.h>
+#include <util/string.h>
 #include <util/syserror.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <versionbits.h>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <compare>
+#include <cstddef>
 #include <cstdint>
-
-#include <condition_variable>
-#include <iterator>
+#include <cstdio>
+#include <functional>
+#include <ios>
+#include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
+#include <ratio>
+#include <set>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 using kernel::CCoinsStats;
 using kernel::CoinStatsHashType;
 
 using interfaces::BlockRef;
-using interfaces::Mining;
 using node::BlockManager;
 using node::NodeContext;
 using node::SnapshotMetadata;
@@ -320,21 +350,19 @@ static RPCMethod waitfornewblock()
                 },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
-    int timeout = 0;
-    if (!request.params[0].isNull())
-        timeout = request.params[0].getInt<int>();
+    const int timeout{self.Arg<int>("timeout")};
     if (timeout < 0) throw JSONRPCError(RPC_MISC_ERROR, "Negative timeout");
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
-    Mining& miner = EnsureMining(node);
+    node::BlockTemplateManager& block_template_manager = EnsureBlockTemplateManager(node);
 
-    // If the caller provided a current_tip value, pass it to waitTipChanged().
+    // If the caller provided a current_tip value, pass it to WaitTipChanged().
     //
-    // If the caller did not provide a current tip hash, call getTip() to get
+    // If the caller did not provide a current tip hash, call GetTip() to get
     // one and wait for the tip to be different from this value. This mode is
     // less reliable because if the tip changed between waitfornewblock calls,
     // it will need to change a second time before this call returns.
-    BlockRef current_block{CHECK_NONFATAL(miner.getTip()).value()};
+    BlockRef current_block{CHECK_NONFATAL(block_template_manager.GetTip()).value()};
 
     uint256 tip_hash{request.params[1].isNull()
         ? current_block.hash
@@ -342,8 +370,8 @@ static RPCMethod waitfornewblock()
 
     // If the user provided an invalid current_tip then this call immediately
     // returns the current tip.
-    std::optional<BlockRef> block = timeout ? miner.waitTipChanged(tip_hash, std::chrono::milliseconds(timeout)) :
-                                              miner.waitTipChanged(tip_hash);
+    std::optional<BlockRef> block = timeout ? block_template_manager.WaitTipChanged(tip_hash, std::chrono::milliseconds(timeout)) :
+                                              block_template_manager.WaitTipChanged(tip_hash);
 
     // Return current block upon shutdown
     if (block) current_block = *block;
@@ -379,19 +407,17 @@ static RPCMethod waitforblock()
                 },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
-    int timeout = 0;
+    const int timeout{self.Arg<int>("timeout")};
 
     uint256 hash(ParseHashV(request.params[0], "blockhash"));
 
-    if (!request.params[1].isNull())
-        timeout = request.params[1].getInt<int>();
     if (timeout < 0) throw JSONRPCError(RPC_MISC_ERROR, "Negative timeout");
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
-    Mining& miner = EnsureMining(node);
+    node::BlockTemplateManager& block_template_manager = EnsureBlockTemplateManager(node);
 
     // Abort if RPC came out of warmup too early
-    BlockRef current_block{CHECK_NONFATAL(miner.getTip()).value()};
+    BlockRef current_block{CHECK_NONFATAL(block_template_manager.GetTip()).value()};
 
     const auto deadline{std::chrono::steady_clock::now() + 1ms * timeout};
     while (current_block.hash != hash) {
@@ -400,9 +426,9 @@ static RPCMethod waitforblock()
             auto now{std::chrono::steady_clock::now()};
             if (now >= deadline) break;
             const MillisecondsDouble remaining{deadline - now};
-            block = miner.waitTipChanged(current_block.hash, remaining);
+            block = block_template_manager.WaitTipChanged(current_block.hash, remaining);
         } else {
-            block = miner.waitTipChanged(current_block.hash);
+            block = block_template_manager.WaitTipChanged(current_block.hash);
         }
         // Return current block upon shutdown
         if (!block) break;
@@ -441,19 +467,17 @@ static RPCMethod waitforblockheight()
                 },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
-    int timeout = 0;
+    const int timeout{self.Arg<int>("timeout")};
 
     int height = request.params[0].getInt<int>();
 
-    if (!request.params[1].isNull())
-        timeout = request.params[1].getInt<int>();
     if (timeout < 0) throw JSONRPCError(RPC_MISC_ERROR, "Negative timeout");
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
-    Mining& miner = EnsureMining(node);
+    node::BlockTemplateManager& block_template_manager = EnsureBlockTemplateManager(node);
 
     // Abort if RPC came out of warmup too early
-    BlockRef current_block{CHECK_NONFATAL(miner.getTip()).value()};
+    BlockRef current_block{CHECK_NONFATAL(block_template_manager.GetTip()).value()};
 
     const auto deadline{std::chrono::steady_clock::now() + 1ms * timeout};
 
@@ -463,9 +487,9 @@ static RPCMethod waitforblockheight()
             auto now{std::chrono::steady_clock::now()};
             if (now >= deadline) break;
             const MillisecondsDouble remaining{deadline - now};
-            block = miner.waitTipChanged(current_block.hash, remaining);
+            block = block_template_manager.WaitTipChanged(current_block.hash, remaining);
         } else {
-            block = miner.waitTipChanged(current_block.hash);
+            block = block_template_manager.WaitTipChanged(current_block.hash);
         }
         // Return current block on shutdown
         if (!block) break;
@@ -540,7 +564,7 @@ static RPCMethod getblockfrompeer()
         RPCResult{RPCResult::Type::OBJ, "", /*optional=*/false, "", {}},
         RPCExamples{
             HelpExampleCli("getblockfrompeer", "\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\" 0")
-            + HelpExampleRpc("getblockfrompeer", "\"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09\" 0")
+            + HelpExampleRpc("getblockfrompeer", R"("00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09", 0)")
         },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -648,9 +672,7 @@ static RPCMethod getblockheader()
 {
     uint256 hash(ParseHashV(request.params[0], "hash"));
 
-    bool fVerbose = true;
-    if (!request.params[1].isNull())
-        fVerbose = request.params[1].get_bool();
+    const bool fVerbose{self.Arg<bool>("verbose")};
 
     const CBlockIndex* pblockindex;
     const CBlockIndex* tip;
@@ -1064,7 +1086,7 @@ static RPCMethod gettxoutsetinfo()
                     HelpExampleCli("gettxoutsetinfo", "") +
                     HelpExampleCli("gettxoutsetinfo", R"("none")") +
                     HelpExampleCli("gettxoutsetinfo", R"("none" 1000)") +
-                    HelpExampleCli("gettxoutsetinfo", R"("none" '"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09"')") +
+                    HelpExampleCli("gettxoutsetinfo", R"("none" 00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09)") +
                     HelpExampleCli("-named gettxoutsetinfo", R"(hash_type='muhash' use_index='false')") +
                     HelpExampleRpc("gettxoutsetinfo", "") +
                     HelpExampleRpc("gettxoutsetinfo", R"("none")") +
@@ -1076,7 +1098,7 @@ static RPCMethod gettxoutsetinfo()
     UniValue ret(UniValue::VOBJ);
 
     const CoinStatsHashType hash_type{ParseHashType(self.Arg<std::string_view>("hash_type"))};
-    bool index_requested = request.params[2].isNull() || request.params[2].get_bool();
+    const bool index_requested{self.Arg<bool>("use_index")};
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
     ChainstateManager& chainman = EnsureChainman(node);
@@ -1190,7 +1212,7 @@ static RPCMethod gettxout()
         "gettxout",
         "Returns details about an unspent transaction output.\n",
         {
-            {"txid", RPCArg::Type::STR, RPCArg::Optional::NO, "The transaction id"},
+            {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The transaction id"},
             {"n", RPCArg::Type::NUM, RPCArg::Optional::NO, "vout number"},
             {"include_mempool", RPCArg::Type::BOOL, RPCArg::Default{true}, "Whether to include the mempool. Note that an unspent output that is spent in the mempool won't appear."},
         },
@@ -1228,9 +1250,7 @@ static RPCMethod gettxout()
 
     auto hash{Txid::FromUint256(ParseHashV(request.params[0], "txid"))};
     COutPoint out{hash, request.params[1].getInt<uint32_t>()};
-    bool fMempool = true;
-    if (!request.params[2].isNull())
-        fMempool = request.params[2].get_bool();
+    const bool fMempool{self.Arg<bool>("include_mempool")};
 
     Chainstate& active_chainstate = chainman.ActiveChainstate();
     CCoinsViewCache* coins_view = &active_chainstate.CoinsTip();
@@ -1269,12 +1289,12 @@ static RPCMethod verifychain()
     return RPCMethod{
         "verifychain",
         "Verifies blockchain database.\n",
-                {
-                    {"checklevel", RPCArg::Type::NUM, RPCArg::DefaultHint{strprintf("%d, range=0-4", DEFAULT_CHECKLEVEL)},
-                        strprintf("How thorough the block verification is:\n%s", MakeUnorderedList(CHECKLEVEL_DOC))},
-                    {"nblocks", RPCArg::Type::NUM, RPCArg::DefaultHint{strprintf("%d, 0=all", DEFAULT_CHECKBLOCKS)}, "The number of blocks to check."},
-                },
-                RPCResult{
+        {
+            {"checklevel", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_CHECKLEVEL},
+                strprintf("How thorough the block verification is (range 0-4):\n%s", MakeUnorderedList(CHECKLEVEL_DOC))},
+            {"nblocks", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_CHECKBLOCKS}, "The number of blocks to check (0=all)."},
+        },
+        RPCResult{
                     RPCResult::Type::BOOL, "", "Verification finished successfully. If false, check debug log for reason."},
                 RPCExamples{
                     HelpExampleCli("verifychain", "")
@@ -1282,8 +1302,8 @@ static RPCMethod verifychain()
                 },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {
-    const int check_level{request.params[0].isNull() ? DEFAULT_CHECKLEVEL : request.params[0].getInt<int>()};
-    const int check_depth{request.params[1].isNull() ? DEFAULT_CHECKBLOCKS : request.params[1].getInt<int>()};
+    const int check_level{self.Arg<int>("checklevel")};
+    const int check_depth{self.Arg<int>("nblocks")};
 
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     LOCK(cs_main);
@@ -1518,7 +1538,7 @@ RPCMethod getdeploymentinfo()
         "Returns an object containing various state info regarding deployments of consensus changes.\n"
         "Consensus changes for which the new rules are enforced from genesis are not listed in \"deployments\".",
         {
-            {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Default{"hash of current chain tip"}, "The block hash at which to query deployment state"},
+            {"blockhash", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"hash of current chain tip"}, "The block hash at which to query deployment state"},
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "", {
@@ -1684,6 +1704,9 @@ static RPCMethod preciousblock()
     return RPCMethod{
         "preciousblock",
         "Treats a block as if it were received before others with the same work.\n"
+                "\nThis only breaks ties between chains with equal work. If the specified block has the same work as the current tip, "
+                "the node switches its active chain to it. If the specified block has less work than the current tip (including any "
+                "ancestor of the tip), the call has no effect. If another chain later gains more work, the node switches to it as usual.\n"
                 "\nA later preciousblock call can override the effect of an earlier one.\n"
                 "\nThe effects of preciousblock are not retained across restarts.\n",
                 {
@@ -2021,7 +2044,7 @@ static RPCMethod getblockstats()
                 {RPCResult::Type::NUM, "utxo_size_inc_actual", /*optional=*/true, "The increase/decrease in size for the utxo index, not counting unspendables"},
             }},
                 RPCExamples{
-                    HelpExampleCli("getblockstats", R"('"00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09"' '["minfeerate","avgfeerate"]')") +
+                    HelpExampleCli("getblockstats", R"(00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09 '["minfeerate","avgfeerate"]')") +
                     HelpExampleCli("getblockstats", R"(1000 '["minfeerate","avgfeerate"]')") +
                     HelpExampleRpc("getblockstats", R"("00000000c937983704a73af28acdec37b049d214adbda81d7e2a3dd146f6ed09", ["minfeerate","avgfeerate"])") +
                     HelpExampleRpc("getblockstats", R"(1000, ["minfeerate","avgfeerate"])")
@@ -2213,7 +2236,7 @@ static RPCMethod getblockstats()
         if (value.isNull()) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid selected statistic '%s'", stat));
         }
-        ret.pushKV(stat, value);
+        ret.pushKVEnd(stat, value);
     }
     return ret;
 },
@@ -2633,13 +2656,10 @@ static RPCMethod scanblocks()
         {
             LOCK(cs_main);
             CChain& active_chain = chainman.ActiveChain();
-            start_index = active_chain.Genesis();
+            start_index = active_chain[self.Arg<int>("start_height")];
             stop_block = active_chain.Tip(); // If no stop block is provided, stop at the chain tip.
-            if (!request.params[2].isNull()) {
-                start_index = active_chain[request.params[2].getInt<int>()];
-                if (!start_index) {
-                    throw JSONRPCError(RPC_MISC_ERROR, "Invalid start_height");
-                }
+            if (!start_index) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Invalid start_height");
             }
             if (!request.params[3].isNull()) {
                 stop_block = active_chain[request.params[3].getInt<int>()];
@@ -2903,10 +2923,7 @@ static RPCMethod getdescriptoractivity()
         }
     }
 
-    bool search_mempool = true;
-    if (!request.params[2].isNull()) {
-        search_mempool = request.params[2].get_bool();
-    }
+    const bool search_mempool{self.Arg<bool>("include_mempool")};
 
     if (search_mempool) {
         const CTxMemPool& mempool = EnsureMemPool(node);

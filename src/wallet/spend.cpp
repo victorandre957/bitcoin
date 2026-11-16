@@ -31,6 +31,7 @@
 #include <wallet/wallet.h>
 
 #include <cmath>
+#include <vector>
 
 using common::StringForFeeReason;
 using common::TransactionErrorString;
@@ -213,7 +214,7 @@ std::vector<COutput> CoinsResult::All() const
 void CoinsResult::Erase(const std::unordered_set<COutPoint, SaltedOutpointHasher>& coins_to_remove)
 {
     for (auto& [type, vec] : coins) {
-        auto remove_it = std::remove_if(vec.begin(), vec.end(), [&](const COutput& coin) {
+        std::erase_if(vec, [&](const COutput& coin) {
             // remove it if it's on the set
             if (!coins_to_remove.contains(coin.outpoint)) return false;
 
@@ -222,7 +223,6 @@ void CoinsResult::Erase(const std::unordered_set<COutPoint, SaltedOutpointHasher
             if (coin.HasEffectiveValue() && total_effective_amount.has_value()) total_effective_amount = *total_effective_amount - coin.GetEffectiveValue();
             return true;
         });
-        vec.erase(remove_it, vec.end());
     }
 }
 
@@ -672,7 +672,8 @@ FilteredOutputGroups GroupOutputs(const CWallet& wallet,
                     filtered_groups[filter].Push(group, type, positive_only, /*insert_mixed=*/!positive_only);
                     accepted = true;
                 }
-                if (!accepted) ret_discarded_groups.emplace_back(group);
+                // The positive-only groups are a subset of the mixed ones, don't record them twice
+                if (!accepted && !positive_only) ret_discarded_groups.emplace_back(group);
             }
         }
     };
@@ -1151,8 +1152,8 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     coin_selection_params.m_discard_feerate = GetDiscardRate(wallet);
 
     // Get the fee rate to use effective values in coin selection
-    FeeCalculation feeCalc;
-    coin_selection_params.m_effective_feerate = GetMinimumFeeRate(wallet, coin_control, &feeCalc);
+    auto min_fee_rate{GetMinimumFeeRate(wallet, coin_control)};
+    coin_selection_params.m_effective_feerate = min_fee_rate.fee_rate;
     // Do not, ever, assume that it's fine to change the fee rate if the user has explicitly
     // provided one
     if (coin_control.m_feerate && coin_selection_params.m_effective_feerate > *coin_control.m_feerate) {
@@ -1160,7 +1161,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         auto msg{strprintf(_("Fee rate (%s) is lower than the minimum fee rate setting (%s)."),
             coin_control.m_feerate->ToString(feerate_format),
             coin_selection_params.m_effective_feerate.ToString(feerate_format))};
-        if (feeCalc.reason == FeeReason::REQUIRED) {
+        if (min_fee_rate.fee_reason == FeeReason::REQUIRED) {
             msg += strprintf(_("\nConsider modifying %s (%s) or %s (%s)."),
                 "-mintxfee",
                 wallet.m_min_fee.ToString(feerate_format),
@@ -1169,7 +1170,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         }
         return util::Error{msg};
     }
-    if (feeCalc.reason == FeeReason::FALLBACK && !wallet.m_allow_fallback_fee) {
+    if (min_fee_rate.fee_reason == FeeReason::FALLBACK && !wallet.m_allow_fallback_fee) {
         // eventually allow a fallback fee
         return util::Error{strprintf(_("Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable %s."), "-fallbackfee")};
     }
@@ -1417,8 +1418,13 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         return util::Error{_("Transaction too large")};
     }
 
-    if (current_fee > wallet.m_default_max_tx_fee) {
+    if (current_fee > wallet.m_max_tx_fee) {
         return util::Error{TransactionErrorString(TransactionError::MAX_FEE_EXCEEDED)};
+    }
+
+    const int64_t tx_vsize{GetVirtualTransactionSize(*tx)};
+    if (current_fee > wallet.m_max_tx_fee_rate.GetFee(tx_vsize)) {
+        return util::Error{TransactionErrorString(TransactionError::MAX_FEE_RATE_EXCEEDED)};
     }
 
     if (gArgs.GetBoolArg("-walletrejectlongchains", DEFAULT_WALLET_REJECT_LONG_CHAINS)) {
@@ -1433,16 +1439,10 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // accidental reuse.
     reservedest.KeepDestination();
 
-    wallet.WalletLogPrintf("Coin Selection: Algorithm:%s, Waste Metric Score:%d\n", GetAlgorithmName(result.GetAlgo()), result.GetWaste());
-    wallet.WalletLogPrintf("Fee Calculation: Fee:%d Bytes:%u Tgt:%d (requested %d) Reason:\"%s\" Decay %.5f: Estimation: (%g - %g) %.2f%% %.1f/(%.1f %d mem %.1f out) Fail: (%g - %g) %.2f%% %.1f/(%.1f %d mem %.1f out)\n",
-              current_fee, nBytes, feeCalc.returnedTarget, feeCalc.desiredTarget, StringForFeeReason(feeCalc.reason), feeCalc.est.decay,
-              feeCalc.est.pass.start, feeCalc.est.pass.end,
-              (feeCalc.est.pass.totalConfirmed + feeCalc.est.pass.inMempool + feeCalc.est.pass.leftMempool) > 0.0 ? 100 * feeCalc.est.pass.withinTarget / (feeCalc.est.pass.totalConfirmed + feeCalc.est.pass.inMempool + feeCalc.est.pass.leftMempool) : 0.0,
-              feeCalc.est.pass.withinTarget, feeCalc.est.pass.totalConfirmed, feeCalc.est.pass.inMempool, feeCalc.est.pass.leftMempool,
-              feeCalc.est.fail.start, feeCalc.est.fail.end,
-              (feeCalc.est.fail.totalConfirmed + feeCalc.est.fail.inMempool + feeCalc.est.fail.leftMempool) > 0.0 ? 100 * feeCalc.est.fail.withinTarget / (feeCalc.est.fail.totalConfirmed + feeCalc.est.fail.inMempool + feeCalc.est.fail.leftMempool) : 0.0,
-              feeCalc.est.fail.withinTarget, feeCalc.est.fail.totalConfirmed, feeCalc.est.fail.inMempool, feeCalc.est.fail.leftMempool);
-    return CreatedTransactionResult(tx, current_fee, change_pos, feeCalc);
+    wallet.WalletLogPrintf("Coin Selection: Algorithm:%s, Waste Metric Score:%d", GetAlgorithmName(result.GetAlgo()), result.GetWaste());
+    wallet.WalletLogPrintf("Fee Calculation: Fee:%d Bytes:%u, Source: %s",
+                           current_fee, nBytes, StringForFeeReason(min_fee_rate.fee_reason));
+    return CreatedTransactionResult(tx, current_fee, change_pos, min_fee_rate.fee_reason);
 }
 
 util::Result<CreatedTransactionResult> CreateTransaction(
@@ -1491,7 +1491,7 @@ util::Result<CreatedTransactionResult> CreateTransaction(
                txr_grouped.has_value() ? txr_grouped->fee : 0,
                txr_grouped.has_value() && txr_grouped->change_pos.has_value() ? int32_t(*txr_grouped->change_pos) : -1);
         if (txr_grouped) {
-            wallet.WalletLogPrintf("Fee non-grouped = %lld, grouped = %lld, using %s\n",
+            wallet.WalletLogPrintf("Fee non-grouped = %lld, grouped = %lld, using %s",
                 txr_ungrouped.fee, txr_grouped->fee, use_aps ? "grouped" : "non-grouped");
             if (use_aps) return txr_grouped;
         }

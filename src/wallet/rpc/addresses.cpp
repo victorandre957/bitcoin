@@ -2,7 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <bitcoin-build-config.h> // IWYU pragma: keep
+#include <bitcoin-build-config.h>
 
 #include <core_io.h>
 #include <key_io.h>
@@ -48,7 +48,7 @@ RPCMethod getnewaddress()
     }
 
     // Parse the label first so we don't generate a key if there's an error
-    const std::string label{LabelFromValue(request.params[0])};
+    const std::string label{LabelFromValue(self.Arg<UniValue>("label"))};
 
     OutputType output_type = pwallet->m_default_address_type;
     if (!request.params[1].isNull()) {
@@ -642,7 +642,7 @@ RPCMethod listlabels()
             "\nList labels that have sending addresses\n"
             + HelpExampleCli("listlabels", "send") +
             "\nAs a JSON-RPC call\n"
-            + HelpExampleRpc("listlabels", "receive")
+            + HelpExampleRpc("listlabels", R"("receive")")
                 },
         [](const RPCMethod& self, const JSONRPCRequest& request) -> UniValue
 {

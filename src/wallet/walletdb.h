@@ -70,6 +70,8 @@ extern const std::string FLAGS;
 extern const std::string HDCHAIN;
 extern const std::string KEY;
 extern const std::string KEYMETA;
+extern const std::string LAST_DECRYPTED_FEATURES;
+extern const std::string LAST_OPENED_FEATURES;
 extern const std::string LOCKED_UTXO;
 extern const std::string MASTER_KEY;
 extern const std::string MINVERSION;
@@ -88,7 +90,7 @@ extern const std::string WALLETDESCRIPTORKEY;
 extern const std::string WATCHMETA;
 extern const std::string WATCHS;
 
-// Keys in this set pertain only to the legacy wallet (LegacyScriptPubKeyMan) and are removed during migration from legacy to descriptors.
+// Keys in this set pertain only to legacy wallets and are removed during migration to descriptors.
 extern const std::unordered_set<std::string> LEGACY_TYPES;
 } // namespace DBKeys
 
@@ -99,8 +101,6 @@ public:
     uint32_t nExternalChainCounter;
     uint32_t nInternalChainCounter;
     CKeyID seed_id; //!< seed hash160
-    int64_t m_next_external_index{0}; // Next index in the keypool to be used. Memory only.
-    int64_t m_next_internal_index{0}; // Next index in the keypool to be used. Memory only.
 
     static constexpr int VERSION_HD_BASE{1};
     static constexpr int VERSION_HD_CHAIN_SPLIT{2};
@@ -230,9 +230,13 @@ public:
     bool WritePurpose(const std::string& strAddress, const std::string& purpose);
     bool ErasePurpose(const std::string& strAddress);
 
-    bool WriteTx(const CWalletTx& wtx);
+    // Write a CWalletTx and all variant witness txs (single tx record and multiple wtxvariant records)
+    bool WriteFullTx(const CWalletTx& wtx);
     bool EraseTx(Txid hash);
+    // Write a single witness variant of CWalletTx (single wtxvariant record)
     bool WriteWtxVariant(const Txid& txid, const CTransactionRef& tx);
+    // Write only the canonical witness tx and all of the tx metadata (single tx record)
+    bool WriteTxMetadata(const CWalletTx& wtx);
 
     bool WriteKeyMetadata(const CKeyMetadata& meta, const CPubKey& pubkey, bool overwrite);
     bool WriteKey(const CPubKey& vchPubKey, const CPrivKey& vchPrivKey, const CKeyMetadata &keyMeta);
@@ -271,13 +275,18 @@ public:
 
     DBErrors LoadWallet(CWallet* pwallet);
 
-    //! Write the given client_version.
-    bool WriteVersion(int client_version) { return m_batch->Write(DBKeys::VERSION, CLIENT_VERSION); }
+    //! Write the current client version in the VERSION record
+    [[nodiscard]] bool WriteLastOpenedVersion();
+    //! Write the current client features in the LAST_OPENED_FEATURES record
+    [[nodiscard]] bool WriteLastOpenedFeatures();
+    //! Write the current wallet client features to the LAST_DECRYPTED_FEATURES record
+    [[nodiscard]] bool WriteLastDecryptedFeatures();
 
     //! Delete records of the given types
     bool EraseRecords(const std::unordered_set<std::string>& types);
 
     bool WriteWalletFlags(uint64_t flags);
+
     //! Begin a new transaction
     bool TxnBegin();
     //! Commit current transaction
@@ -287,7 +296,7 @@ public:
     bool HasActiveTxn() { return m_batch->HasActiveTxn(); }
 
     //! Registers db txn callback functions
-    void RegisterTxnListener(const DbTxnListener& l);
+    void RegisterTxnListener(DbTxnListener l);
 
 private:
     std::unique_ptr<DatabaseBatch> m_batch;

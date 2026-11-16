@@ -27,8 +27,7 @@ from test_framework.wallet_util import get_generate_key
 class ListTransactionsTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 3
-        # whitelist peers to speed up tx relay / mempool sync
-        self.noban_tx_relay = True
+        self.noban_tx_relay = True  # faster tx relay
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -157,7 +156,7 @@ class ListTransactionsTest(BitcoinTestFramework):
 
     def run_coinjoin_test(self):
         self.log.info('Check "coin-join" transaction')
-        input_0 = next(i for i in self.nodes[0].listunspent(query_options={"minimumAmount": 0.2}, include_unsafe=False))
+        input_0 = next(i for i in self.nodes[0].listunspent(minimum_amount=0.2, include_unsafe=False))
         input_1 = next(i for i in self.nodes[1].listunspent(query_options={"minimumAmount": 0.2}, include_unsafe=False))
         raw_hex = self.nodes[0].createrawtransaction(
             inputs=[
@@ -187,8 +186,19 @@ class ListTransactionsTest(BitcoinTestFramework):
         self.log.info("Test listtransactions RPC parameter validity")
         assert_raises_rpc_error(-8, 'Label argument must be a valid label name or "*".', self.nodes[0].listtransactions, label="")
         self.nodes[0].listtransactions(label="*")
-        assert_raises_rpc_error(-8, "Negative count", self.nodes[0].listtransactions, count=-1)
-        assert_raises_rpc_error(-8, "Negative from", self.nodes[0].listtransactions, skip=-1)
+        assert_raises_rpc_error(-1, "JSON integer out of range", self.nodes[0].listtransactions, count=-1)
+        assert_raises_rpc_error(-1, "JSON integer out of range", self.nodes[0].listtransactions, skip=-1)
+
+        self.log.info("Test listtransactions with large count and skip")
+        INT_MAX = 2**31 - 1
+        UINT32_MAX = 2**32 - 1
+        all_but_newest = self.nodes[0].listtransactions(count=1000000, skip=1)
+        assert_equal(self.nodes[0].listtransactions(count=INT_MAX, skip=1), all_but_newest)
+        assert_equal(self.nodes[0].listtransactions(count=UINT32_MAX, skip=1), all_but_newest)
+        assert_equal(self.nodes[0].listtransactions(count=INT_MAX, skip=INT_MAX), [])
+        assert_equal(self.nodes[0].listtransactions(count=1, skip=INT_MAX), [])
+        assert_equal(self.nodes[0].listtransactions(count=UINT32_MAX, skip=UINT32_MAX), [])
+        assert_raises_rpc_error(-1, "JSON integer out of range", self.nodes[0].listtransactions, count=UINT32_MAX + 1)
 
     def test_op_return(self):
         """Test if OP_RETURN outputs will be displayed correctly."""
@@ -283,7 +293,7 @@ class ListTransactionsTest(BitcoinTestFramework):
         desc = descsum_create(f"tr({xpubs[0].to_string()}/*,pk({xprvs[1].to_string()}/*))")
         assert_equal(wallet.importdescriptors([{"desc": desc, "active": True, "timestamp": "now"}])[0]["success"], True)
         default_wallet.sendtoaddress(wallet.getnewaddress(address_type="bech32m"), 1)
-        self.generate(self.nodes[0], 1, sync_fun=self.no_op)
+        self.generate(self.nodes[0], 1)
         # Isolate node0 for later reorg coverage
         self.disconnect_nodes(0, 1)
         self.disconnect_nodes(0, 2)

@@ -7,13 +7,11 @@
 
 #include <addresstype.h>
 #include <consensus/amount.h>
-#include <node/transaction.h>
-#include <outputtype.h>
+#include <policy/feerate.h>
 #include <pubkey.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <script/script.h>
-#include <script/sign.h>
 #include <uint256.h>
 #include <univalue.h>
 #include <util/check.h>
@@ -21,9 +19,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <initializer_list>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -31,11 +29,11 @@
 #include <variant>
 #include <vector>
 
-class JSONRPCRequest;
-enum ServiceFlags : uint64_t;
 enum class OutputType;
 struct FlatSigningProvider;
 struct bilingual_str;
+class CBlockIndex;
+
 namespace common {
 enum class PSBTError;
 } // namespace common
@@ -43,7 +41,7 @@ namespace node {
 enum class TransactionError;
 } // namespace node
 
-static constexpr bool DEFAULT_RPC_DOC_CHECK{
+inline constexpr bool DEFAULT_RPC_DOC_CHECK{
 #ifdef RPC_DOC_CHECK
     true
 #else
@@ -63,8 +61,6 @@ extern const std::string UNIX_EPOCH_TIME;
  */
 extern const std::string EXAMPLE_ADDRESS[2];
 
-class FillableSigningProvider;
-class CScript;
 struct Sections;
 
 struct HelpResult : std::runtime_error {
@@ -155,6 +151,9 @@ std::pair<int64_t, int64_t> ParseDescriptorRange(const UniValue& value);
 
 /** Evaluate a descriptor given as a string, or as a {"desc":...,"range":...} object, with default range of 1000. */
 std::vector<CScript> EvalDescriptorStringOrObject(const UniValue& scanobject, FlatSigningProvider& provider, bool expand_priv = false);
+
+//! Parse BIP32 path
+std::vector<uint32_t> ParsePathBIP32(const std::string& path);
 
 /**
  * Serializing JSON objects depends on the outer type. Only arrays and
@@ -396,10 +395,6 @@ struct RPCResult {
 
     /** Append the sections of the result. */
     void ToSections(Sections& sections, OuterType outer_type = OuterType::NONE, int current_indent = 0) const;
-    /** Return the type string of the result when it is in an object (dict). */
-    std::string ToStringObj() const;
-    /** Return the description string, including the result type. */
-    std::string ToDescriptionString() const;
     /** Check whether the result JSON type matches.
      * Returns true if type matches, or object describing error(s) if not.
      */
@@ -463,6 +458,7 @@ public:
      *
      * The instantiation of this helper for type R must match the corresponding RPCArg::Type.
      *
+     * @param key The first name of the argument. Aliases are not supported.
      * @return The value of the RPC argument (or the default value) cast to type R.
      *
      * @see MaybeArg for handling optional arguments without default values.
@@ -493,6 +489,7 @@ public:
      *
      * The instantiation of this helper for type R must match the corresponding RPCArg::Type.
      *
+     * @param key The first name of the argument. Aliases are not supported.
      * @return For trivially copyable types, a std::optional<R> is returned.
      *         For other types, a R* pointer to the argument is returned. If the
      *         argument is not provided, std::nullopt or a null pointer is returned.
@@ -534,7 +531,7 @@ private:
     mutable const JSONRPCRequest* m_req{nullptr}; // A pointer to the request for the duration of m_fun()
     template <typename R>
     R ArgValue(size_t i) const;
-    //! Return positional index of a parameter using its name as key.
+    //! Return positional index of a parameter using its first name as key.
     size_t GetParamIndex(std::string_view key) const;
 };
 

@@ -3,9 +3,9 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-/**
- * Utilities for converting data from/to strings.
- */
+//! @file
+//! @brief Utilities for converting data from/to strings.
+
 #ifndef BITCOIN_UTIL_STRENCODINGS_H
 #define BITCOIN_UTIL_STRENCODINGS_H
 
@@ -224,7 +224,7 @@ bool ConvertBits(O outfn, It it, It end, I infn = {})
     constexpr size_t maxv = (1 << tobits) - 1;
     constexpr size_t max_acc = (1 << (frombits + tobits - 1)) - 1;
     while (it != end) {
-        int v = infn(*it);
+        int v{infn(*it)};
         if (v < 0) return false;
         acc = ((acc << frombits) | v) & max_acc;
         bits += frombits;

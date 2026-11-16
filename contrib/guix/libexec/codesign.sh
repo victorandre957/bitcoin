@@ -6,7 +6,7 @@ export LC_ALL=C.UTF-8
 set -o errexit -o pipefail
 
 # Environment variables for determinism
-export TAR_OPTIONS="--owner=0 --group=0 --numeric-owner --mtime='@${SOURCE_DATE_EPOCH}' --sort=name"
+export TAR_OPTIONS="--no-same-owner --owner=0 --group=0 --numeric-owner --mtime='@${SOURCE_DATE_EPOCH}' --sort=name"
 export TZ=UTC
 
 # Although Guix _does_ set umask when building its own packages (in our case,
@@ -85,8 +85,13 @@ mkdir -p "$DISTSRC"
                 osslsigncode attach-signature \
                                  -in "${bin}" \
                                  -out "${WORKDIR}/${bin_base/-unsigned}" \
-                                 -CAfile "$GUIX_ENVIRONMENT/etc/ssl/certs/ca-certificates.crt" \
                                  -sigin codesignatures/win/"${bin_base}".pem
+                osslsigncode verify \
+                                 -CAfile "$GUIX_ENVIRONMENT/etc/ssl/certs/ca-certificates.crt" \
+                                 -TSA-CAfile "$GUIX_ENVIRONMENT/etc/ssl/certs/ca-certificates.crt" \
+                                 -ignore-crl \
+                                 -ignore-cdp \
+                                 -in "${WORKDIR}/${bin_base/-unsigned}"
             done
 
             # Move installer to outdir

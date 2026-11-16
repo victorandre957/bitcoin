@@ -11,6 +11,9 @@ from test_framework.blocktools import (
     add_witness_commitment,
     MAX_BLOCK_SIGOPS_WEIGHT,
 )
+from test_framework.mempool_util import (
+    TRUC_MAX_VSIZE,
+)
 from test_framework.messages import (
     COutPoint,
     CTransaction,
@@ -670,7 +673,6 @@ DUST_LIMIT = 600
 MIN_FEE = 50000
 
 TX_STANDARD_VERSIONS = [1, 2, TX_MAX_STANDARD_VERSION]
-TRUC_MAX_VSIZE = 10000 # test doesn't cover in-mempool spends, so only this limit is hit
 
 # === Actual test cases ===
 
@@ -1206,6 +1208,7 @@ def spenders_taproot_active():
         add_spender(spenders, "opsuccess/bigpush", standard=False, tap=tap, leaf="bigpush_success", failure={"leaf": "bigpush_nop"}, **ERR_PUSH_SIZE)
         add_spender(spenders, "opsuccess/1001push", standard=False, tap=tap, leaf="1001push_success", failure={"leaf": "1001push_nop"}, **ERR_STACK_SIZE)
         add_spender(spenders, "opsuccess/1001inputs", standard=False, tap=tap, leaf="bare_success", inputs=[b'']*1001, failure={"leaf": "bare_nop"}, **ERR_STACK_SIZE)
+        add_spender(spenders, "opsuccess/bigstackelem", standard=False, tap=tap, leaf="bare_success", inputs=[random.randbytes(MAX_SCRIPT_ELEMENT_SIZE+1)], failure={"leaf": "bare_nop"}, **ERR_PUSH_SIZE)
 
     # Non-OP_SUCCESSx (verify that those aren't accidentally treated as OP_SUCCESSx)
     for opval in range(0, 0x100):
@@ -1635,6 +1638,7 @@ class TaprootTest(BitcoinTestFramework):
                     fail_input is None  # Must be valid to be standard
                     and (all(utxo.spender.is_standard for utxo in input_utxos))  # All inputs must be standard
                     and tx.version in TX_STANDARD_VERSIONS # The tx version must be standard
+                    # test doesn't cover in-mempool spends, so only TRUC_MAX_VSIZE limit is hit
                     and not (tx.version == 3 and tx.get_vsize() > TRUC_MAX_VSIZE)  # Topological standardness rules must be followed
                 )
                 msg = ','.join(utxo.spender.comment + ("*" if n == fail_input else "") for n, utxo in enumerate(input_utxos))

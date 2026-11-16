@@ -15,6 +15,7 @@
 #include <test/util/setup_common.h>
 #include <test/util/time.h>
 #include <test/util/validation.h>
+#include <util/check.h>
 #include <util/time.h>
 #include <validationinterface.h>
 
@@ -53,7 +54,7 @@ FUZZ_TARGET(p2p_private_broadcast, .init = ::initialize)
     connman.Reset();
     auto& chainman{static_cast<TestChainstateManager&>(*node.chainman)};
 
-    FakeNodeClock clock_ctx{1610000000s};
+    FakeNodeClock clock_ctx{1610000000s}; // 2021-01-07, arbitrary
     FakeSteadyClock steady_clock;
     chainman.ResetIbd();
     // Sometimes leave IBD: incoming TX processing (the broadcast-abort path)

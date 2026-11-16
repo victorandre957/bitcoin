@@ -25,10 +25,10 @@ class BlockFilter;
 class CBlockIndex;
 enum class BlockFilterType : uint8_t;
 
-static const char* const DEFAULT_BLOCKFILTERINDEX = "0";
+inline constexpr const char* DEFAULT_BLOCKFILTERINDEX{"0"};
 
 /** Interval between compact filter checkpoints. See BIP 157. */
-static constexpr int CFCHECKPT_INTERVAL = 1000;
+inline constexpr int CFCHECKPT_INTERVAL = 1000;
 
 /**
  * BlockFilterIndex is used to store and retrieve block filters, hashes, and headers for a range of
@@ -47,7 +47,7 @@ private:
     std::unique_ptr<FlatFileSeq> m_filter_fileseq;
 
     bool ReadFilterFromDisk(const FlatFilePos& pos, const uint256& hash, BlockFilter& filter) const;
-    size_t WriteFilterToDisk(FlatFilePos& pos, const BlockFilter& filter);
+    uint64_t WriteFilterToDisk(FlatFilePos& pos, const BlockFilter& filter);
 
     Mutex m_cs_headers_cache;
     /** cache of block hash to filter header, to avoid disk access when responding to getcfcheckpt. */

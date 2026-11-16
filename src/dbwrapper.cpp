@@ -153,6 +153,30 @@ static leveldb::Options GetOptions(size_t nCacheSize, bool bloom_filter)
     return options;
 }
 
+bool CDBWrapper::HasKeyStartingWith(const fs::path& path, uint8_t prefix)
+{
+    if (!fs::exists(path / "CURRENT")) return false;
+
+    CBitcoinLevelDBLogger logger;
+    leveldb::Options options;
+    options.paranoid_checks = true;
+    // Avoid creating or rotating LevelDB's LOG files during this probe.
+    options.info_log = &logger;
+
+    leveldb::DB* raw_db;
+    HandleError(leveldb::DB::Open(options, fs::PathToString(path), &raw_db));
+    const std::unique_ptr<leveldb::DB> db{raw_db};
+
+    leveldb::ReadOptions iteroptions;
+    iteroptions.verify_checksums = true;
+    iteroptions.fill_cache = false;
+    const std::unique_ptr<leveldb::Iterator> it{db->NewIterator(iteroptions)};
+    const leveldb::Slice prefix_slice{reinterpret_cast<const char*>(&prefix), sizeof(prefix)};
+    it->Seek(prefix_slice);
+    HandleError(it->status());
+    return it->Valid() && it->key().starts_with(prefix_slice);
+}
+
 struct CDBBatch::WriteBatchImpl {
     leveldb::WriteBatch batch;
 };
@@ -371,15 +395,16 @@ struct CDBIterator::IteratorImpl {
     explicit IteratorImpl(leveldb::Iterator* _iter) : iter{_iter} {}
 };
 
-CDBIterator::CDBIterator(const CDBWrapper& _parent, std::unique_ptr<IteratorImpl> _piter) : parent(_parent),
-                                                                                            m_impl_iter(std::move(_piter))
+CDBIterator::CDBIterator(const CDBWrapper& _parent, util::NotNullUniquePtr<IteratorImpl> _piter)
+    : parent(_parent),
+      m_impl_iter(std::move(_piter))
 {
     m_scratch.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);
 }
 
 CDBIterator* CDBWrapper::NewIterator()
 {
-    return new CDBIterator{*this, std::make_unique<CDBIterator::IteratorImpl>(DBContext().pdb->NewIterator(DBContext().iteroptions))};
+    return new CDBIterator{*this, util::MakeNotNullUnique<CDBIterator::IteratorImpl>(DBContext().pdb->NewIterator(DBContext().iteroptions))};
 }
 
 void CDBIterator::SeekImpl(std::span<const std::byte> key)

@@ -7,37 +7,52 @@
 
 #include <blockfilter.h>
 #include <chain.h>
-#include <chainparams.h>
+#include <coins.h>
+#include <consensus/params.h>
 #include <core_io.h>
+#include <crypto/hex_base.h>
 #include <flatfile.h>
 #include <httpserver.h>
 #include <index/blockfilterindex.h>
 #include <index/txindex.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
+#include <node/transaction.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <rpc/blockchain.h>
 #include <rpc/mempool.h>
 #include <rpc/protocol.h>
+#include <rpc/request.h>
 #include <rpc/server.h>
-#include <rpc/server_util.h>
+#include <rpc/util.h>
+#include <serialize.h>
 #include <streams.h>
 #include <sync.h>
+#include <tinyformat.h>
 #include <txmempool.h>
+#include <uint256.h>
 #include <undo.h>
+#include <univalue.h>
 #include <util/any.h>
 #include <util/check.h>
 #include <util/overflow.h>
 #include <util/strencodings.h>
+#include <util/string.h>
 #include <validation.h>
 
 #include <any>
+#include <cstdint>
+#include <cstring>
+#include <ios>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
 #include <vector>
 
-#include <univalue.h>
-
-using http_bitcoin::HTTPRequest;
 using node::GetTransaction;
 using node::NodeContext;
 using util::SplitString;
@@ -310,6 +325,8 @@ static void BlockUndoToJSON(const CBlockUndo& block_undo, UniValue& result)
         UniValue tx_prevouts(UniValue::VARR);
         for (const Coin& coin : tx_undo.vprevout) {
             UniValue prevout(UniValue::VOBJ);
+            prevout.pushKV("generated", coin.IsCoinBase());
+            prevout.pushKV("height", coin.nHeight);
             prevout.pushKV("value", ValueFromAmount(coin.out.nValue));
 
             UniValue script_pub_key(UniValue::VOBJ);
@@ -355,8 +372,12 @@ static bool rest_spent_txouts(const std::any& context, HTTPRequest* req, const s
     }
 
     CBlockUndo block_undo;
-    if (pblockindex->nHeight > 0 && !chainman->m_blockman.ReadBlockUndo(block_undo, *pblockindex)) {
-        return RESTERR(req, HTTP_NOT_FOUND, hashStr + " undo not available");
+    if (pblockindex->nHeight > 0) {
+        // Blocks that were never connected or have been pruned have no undo data.
+        const bool have_undo{WITH_LOCK(cs_main, return (pblockindex->nStatus & BLOCK_HAVE_UNDO) != 0)};
+        if (!have_undo || !chainman->m_blockman.ReadBlockUndo(block_undo, *pblockindex)) {
+            return RESTERR(req, HTTP_NOT_FOUND, hashStr + " undo not available");
+        }
     }
 
     switch (rf) {

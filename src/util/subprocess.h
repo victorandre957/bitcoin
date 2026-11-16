@@ -1,6 +1,11 @@
 // Based on the https://github.com/arun11299/cpp-subprocess project.
 
+#ifndef BITCOIN_UTIL_SUBPROCESS_H
+#define BITCOIN_UTIL_SUBPROCESS_H
+
 /*!
+@file
+@brief C++ subprocessing library.
 
 Documentation for C++ subprocessing library.
 
@@ -32,9 +37,6 @@ Documentation for C++ subprocessing library.
 
 @version 1.0.0
 */
-
-#ifndef BITCOIN_UTIL_SUBPROCESS_H
-#define BITCOIN_UTIL_SUBPROCESS_H
 
 #include <util/check.h>
 #include <util/syserror.h>
@@ -110,12 +112,12 @@ namespace subprocess {
 
 // Max buffer size allocated on stack for read error
 // from pipe
-static const size_t SP_MAX_ERR_BUF_SIZ = 1024;
+inline constexpr size_t SP_MAX_ERR_BUF_SIZ = 1024;
 
 // Default buffer capacity for OutBuffer and ErrBuffer.
 // If the data exceeds this capacity, the buffer size is grown
 // by 1.5 times its previous capacity
-static const size_t DEFAULT_BUF_CAP_BYTES = 8192;
+inline constexpr size_t DEFAULT_BUF_CAP_BYTES = 8192;
 
 
 /*-----------------------------------------------
@@ -1088,7 +1090,7 @@ inline void Popen::execute_process() noexcept(false)
 
   for (auto arg : this->vargs_) {
     if (!first_arg) {
-      command_line += " ";
+      command_line += ' ';
     } else {
       first_arg = false;
     }
@@ -1096,9 +1098,6 @@ inline void Popen::execute_process() noexcept(false)
     util::quote_argument(argument, command_line, /*force=*/false);
   }
 
-  // CreateProcessA can modify szCmdLine so we allocate needed memory
-  char *szCmdline = new char[command_line.size() + 1];
-  strcpy_s(szCmdline, command_line.size() + 1, command_line.c_str());
   PROCESS_INFORMATION piProcInfo;
   STARTUPINFOA siStartInfo;
   BOOL bSuccess = FALSE;
@@ -1121,7 +1120,7 @@ inline void Popen::execute_process() noexcept(false)
 
   // Create the child process.
   bSuccess = CreateProcessA(NULL,
-                            szCmdline,    // command line
+                            command_line.data(), // command line
                             NULL,         // process security attributes
                             NULL,         // primary thread security attributes
                             TRUE,         // handles are inherited
@@ -1216,7 +1215,7 @@ inline void Popen::execute_process() noexcept(false)
         // Throw whatever information we have about child failure
         throw CalledProcessError(err_buf, retcode);
       }
-    } catch (std::exception& exp) {
+    } catch (std::exception&) {
       stream_.cleanup_fds();
       throw;
     }

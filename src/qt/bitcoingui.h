@@ -5,7 +5,7 @@
 #ifndef BITCOIN_QT_BITCOINGUI_H
 #define BITCOIN_QT_BITCOINGUI_H
 
-#include <bitcoin-build-config.h> // IWYU pragma: keep
+#include <bitcoin-build-config.h>
 
 #include <qt/bitcoinunits.h>
 #include <qt/clientmodel.h>
@@ -90,7 +90,6 @@ public:
     */
     void addWallet(WalletModel* walletModel);
     void removeWallet(WalletModel* walletModel);
-    void removeAllWallets();
 #endif // ENABLE_WALLET
     bool enableWallet = false;
 

@@ -373,7 +373,7 @@ BOOST_AUTO_TEST_CASE(ReceiveWithExtraTransactions) {
         BOOST_CHECK_EQUAL(partial_block_with_extra_collision.InitData(cmpctblock, extra_txn), READ_STATUS_OK);
         BOOST_CHECK(partial_block_with_extra_collision.IsTxAvailable(1));
         BOOST_CHECK(!partial_block_with_extra_collision.IsTxAvailable(2));
-        BOOST_CHECK_EQUAL(partial_block_with_extra_collision.GetMempoolCount(), 1U);
+        BOOST_CHECK_EQUAL(partial_block_with_extra_collision.GetMempoolCount(), 0U);
         BOOST_CHECK_EQUAL(partial_block_with_extra_collision.GetExtraCount(), 1U);
 
         // Now also collide the extra-sourced slot: both counters decrement exactly once.
@@ -454,16 +454,7 @@ BOOST_AUTO_TEST_CASE(TransactionsRequestDeserializationOverflowTest) {
     WriteCompactSize(stream, req0.indexes[2]);
 
     BlockTransactionsRequest req1;
-    try {
-        stream >> req1;
-        // before patch: deserialize above succeeds and this check fails, demonstrating the overflow
-        BOOST_CHECK(req1.indexes[1] < req1.indexes[2]);
-        // this shouldn't be reachable before or after patch
-        BOOST_CHECK(0);
-    } catch(std::ios_base::failure &) {
-        // deserialize should fail
-        BOOST_CHECK(true); // Needed to suppress "Test case [...] did not check any assertions"
-    }
+    BOOST_CHECK_EXCEPTION(stream >> req1, std::ios_base::failure, HasReason{"differential value overflow"});
 }
 
 BOOST_AUTO_TEST_SUITE_END()
