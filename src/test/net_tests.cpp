@@ -46,11 +46,15 @@ BOOST_AUTO_TEST_CASE(cnode_listen_port)
     // test default
     uint16_t port{GetListenPort()};
     BOOST_CHECK(port == Params().GetDefaultPort());
-    // test set port
-    uint16_t altPort = 12345;
-    BOOST_CHECK(gArgs.SoftSetArg("-port", ToString(altPort)));
+    // test persisted randomized port ignored until -port=0 is used
+    uint16_t randomized_port = 50000;
+    BOOST_CHECK(gArgs.SoftSetArg(RANDOMIZED_P2P_PORT_ARG, ToString(randomized_port)));
     port = GetListenPort();
-    BOOST_CHECK(port == altPort);
+    BOOST_CHECK(port == Params().GetDefaultPort());
+    // test persisted randomized port
+    BOOST_CHECK(gArgs.SoftSetArg("-port", "0"));
+    port = GetListenPort();
+    BOOST_CHECK(port == randomized_port);
 }
 
 BOOST_AUTO_TEST_CASE(cnode_simple_test)

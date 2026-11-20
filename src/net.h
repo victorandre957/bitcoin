@@ -107,7 +107,13 @@ inline constexpr bool DEFAULT_FIXEDSEEDS{true};
 inline constexpr size_t DEFAULT_MAXRECEIVEBUFFER = 5 * 1000;
 inline constexpr size_t DEFAULT_MAXSENDBUFFER    = 1 * 1000;
 
-inline constexpr bool DEFAULT_V2_TRANSPORT{true};
+static constexpr const char* RANDOMIZED_P2P_PORT_ARG{"-randomizedp2pport"};
+static constexpr uint16_t RANDOMIZED_P2P_PORT_MIN{49152};
+static constexpr uint16_t RANDOMIZED_P2P_PORT_MAX{65534};
+
+static constexpr bool DEFAULT_V2_TRANSPORT{true};
+
+typedef int64_t NodeId;
 
 struct AddedNodeParams {
     std::string m_added_node;
